@@ -144,7 +144,9 @@ def compare_with_fixed_vector(file_id, Fv_fixed, threshold=0.5):
     if max_similarity < threshold:
         new_video_id = insert_new_feature_vector(file_id, Fv_fixed)
 
-    return most_similar_video_id, max_similarity
+    msg = "New video inserted." if max_similarity < threshold else "Video too similar to existing video."
+
+    return most_similar_video_id, max_similarity, msg
 
 @app.on_event("startup")
 def startup_event():
@@ -155,9 +157,9 @@ async def compare_video(file_id: str = Form(...), file: UploadFile = File(...)):
     try:
         video_bytes = await file.read()
         features_fixed = extract_feature_vector(video_bytes)
-        video_id, max_similarity = compare_with_fixed_vector(file_id, features_fixed)
+        video_id, max_similarity, msg = compare_with_fixed_vector(file_id, features_fixed)
 
-        return {"video_id": video_id, "max_similarity": max_similarity}
+        return {"video_id": video_id, "max_similarity": max_similarity, "message": msg}
     except Exception as e:
         print(f"Error during video comparison: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error. Please check logs.")
