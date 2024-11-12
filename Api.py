@@ -1,138 +1,169 @@
-import nest_asyncio
-from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import HTMLResponse
-import shutil
-import os
-import uvicorn
-import cv2
-import numpy as np
-from tensorflow.keras.applications.vgg16 import VGG16, preprocess_input
+import sqlite3
+from fastapi import FastAPI, HTTPException, File, UploadFile
+import tensorflow as tf
 from tensorflow.keras.models import Model
+from tensorflow.keras.applications import VGG16
+from tensorflow.keras.applications.vgg16 import preprocess_input
+import numpy as np
+import cv2
 from sklearn.metrics.pairwise import cosine_similarity
+import tempfile
+import os
 
-# Allow asyncio to work in Jupyter
-nest_asyncio.apply()
+# SQLite Database File Path
+DB_PATH = "sqlite_db.db"
 
-# Load VGG16 Model for feature extraction
+app = FastAPI()
+
+# Load the VGG16 model
 base_model = VGG16(weights='imagenet')
 model = Model(inputs=base_model.input, outputs=base_model.get_layer('fc1').output)
 
-def extract_frames(video_path, frame_interval=1):
-    cap = cv2.VideoCapture(video_path)
-    frames = []
-    count = 0
+# Database Initialization Function
+def initialize_database():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS video_features (
+            video_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            feature_vector TEXT
+        );
+    """)
+    conn.commit()
+    cursor.close()
+    conn.close()
 
-    while cap.isOpened():
+# SQLite Connection
+def get_db_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+# Extract exactly 11 frames from video bytes
+# Extract exactly 11 frames from video bytes
+def extract_frames_from_bytes(video_bytes, target_frame_count=11):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video:
+        temp_video.write(video_bytes)
+        temp_video_path = temp_video.name
+
+    cap = cv2.VideoCapture(temp_video_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_indices = np.linspace(0, total_frames - 1, target_frame_count, dtype=int)
+    frames = []
+
+    for idx in frame_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ret, frame = cap.read()
         if not ret:
             break
-        
-        if count % frame_interval == 0:
-            frame = cv2.resize(frame, (224, 224))  
-            frames.append(frame)
-        
-        count += 1
+        frame = cv2.resize(frame, (224, 224))
+        frames.append(frame)
 
     cap.release()
-    return np.array(frames)
+    os.remove(temp_video_path)
 
-def extract_features(frames):
+    # If fewer than target frames were captured, duplicate the last frame
+    while len(frames) < target_frame_count:
+        frames.append(frames[-1])
+
+    # Debug: Print actual number of frames extracted
+    print(f"Extracted {len(frames)} frames.")
+    
+    return np.array(frames[:target_frame_count])  # Ensure exactly `target_frame_count` frames
+
+# Extract a consistent feature vector of shape (11, 4096)
+def extract_feature_vector(video_bytes):
+    frames = extract_frames_from_bytes(video_bytes, target_frame_count=11)
+    
+    if frames.shape[0] != 11:
+        raise ValueError(f"Expected 11 frames but got {frames.shape[0]} frames.")
+    
     features = []
     for frame in frames:
-        frame = np.expand_dims(frame, axis=0) 
-        frame = preprocess_input(frame)       
+        frame = np.expand_dims(frame, axis=0)
+        frame = preprocess_input(frame)
         feature = model.predict(frame)
-        features.append(feature.flatten())    
-    
-    return np.array(features)
+        
+        # Verify feature shape and append
+        if feature.shape == (1, 4096):
+            features.append(feature.flatten())
+        else:
+            raise ValueError(f"Unexpected feature shape: {feature.shape}, expected (1, 4096)")
 
-def compare_videos(video_path1, video_path2, frame_interval=1):
-    frames1 = extract_frames(video_path1, frame_interval)
-    frames2 = extract_frames(video_path2, frame_interval)
+    feature_matrix = np.array(features)
     
-    if len(frames1) != len(frames2):
-        min_frames = min(len(frames1), len(frames2))
-        frames1 = frames1[:min_frames]
-        frames2 = frames2[:min_frames]
+    # Debug: Confirm final feature matrix shape
+    print(f"Feature matrix shape: {feature_matrix.shape}")
+    
+    if feature_matrix.shape != (11, 4096):
+        raise ValueError(f"Feature matrix shape is {feature_matrix.shape}, expected (11, 4096)")
 
-    features1 = extract_features(frames1)
-    features2 = extract_features(frames2)
+    return feature_matrix
+
+
+# Fetch all feature vectors from the database
+def get_all_feature_vectors():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT video_id, feature_vector FROM video_features")
+    results = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return [(video_id, np.array(eval(feature_vector)).reshape(11, 4096)) for video_id, feature_vector in results]
+
+# Insert a new feature vector into the database
+def insert_new_feature_vector(feature_matrix):
+    flattened_vector = feature_matrix.flatten().tolist()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO video_features (feature_vector)
+        VALUES (?)
+        """,
+        (str(flattened_vector),)
+    )
+    video_id = cursor.lastrowid
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return video_id
+
+# Compare the video feature vector with existing vectors in the database
+def compare_with_fixed_vector(Fv_fixed, threshold=0.5):
+    all_feature_vectors = get_all_feature_vectors()
+
+    # If no feature vectors are present in the database, add the new vector
+    if not all_feature_vectors:
+        new_video_id = insert_new_feature_vector(Fv_fixed)
+        return -1, 0
 
     similarities = []
-    for feat1, feat2 in zip(features1, features2):
-        sim = cosine_similarity([feat1], [feat2])[0][0]
-        similarities.append(sim)
-    
-    average_similarity = np.mean(similarities)
-    return average_similarity, features1, features2, similarities
+    for video_id, feature_vector in all_feature_vectors:
+        frame_similarities = [cosine_similarity([f_fixed], [f])[0][0] for f_fixed, f in zip(Fv_fixed, feature_vector)]
+        average_similarity = np.mean(frame_similarities)
+        similarities.append((video_id, average_similarity))
 
-# FastAPI App
-app = FastAPI()
+    max_video_id, max_similarity = max(similarities, key=lambda x: x[1])
 
-@app.get("/", response_class=HTMLResponse)
-async def main():
-    return """
-    <html>
-        <head>
-            <title>Video Similarity Checker</title>
-        </head>
-        <body>
-            <h3>Upload Two Videos to Compare Similarity</h3>
-            <form action="/upload_videos/" enctype="multipart/form-data" method="post">
-                <label for="file1">Video 1:</label>
-                <input name="file1" type="file" accept="video/*">
-                <br><br>
-                <label for="file2">Video 2:</label>
-                <input name="file2" type="file" accept="video/*">
-                <br><br>
-                <input type="submit">
-            </form>
-        </body>
-    </html>
-    """
+    if max_similarity < threshold:
+        new_video_id = insert_new_feature_vector(Fv_fixed)
+        return new_video_id, max_similarity
+    else:
+        return max_video_id, max_similarity
 
-@app.post("/upload_videos/")
-async def upload_videos(file1: UploadFile = File(...), file2: UploadFile = File(...)):
-    video1_path = f"temp_{file1.filename}"
-    video2_path = f"temp_{file2.filename}"
-    
-    with open(video1_path, "wb") as buffer:
-        shutil.copyfileobj(file1.file, buffer)
-        
-    with open(video2_path, "wb") as buffer:
-        shutil.copyfileobj(file2.file, buffer)
+@app.on_event("startup")
+def startup_event():
+    initialize_database()
 
+@app.post("/compare-video-bytes/")
+async def compare_video(file: UploadFile = File(...)):
     try:
-        # Compare the videos and get similarity score and feature vectors
-        similarity_score, features1, features2, similarities = compare_videos(video1_path, video2_path, frame_interval=30)
-        
-        # Cleanup temporary files
-        os.remove(video1_path)
-        os.remove(video2_path)
-        
-        # Create a detailed output for the feature vectors and similarity score
-        feature_vectors_str1 = f"<h4>Feature Vectors for Video 1:</h4><pre>{np.array_str(features1)}</pre>"
-        feature_vectors_str2 = f"<h4>Feature Vectors for Video 2:</h4><pre>{np.array_str(features2)}</pre>"
-        similarity_vectors_str = f"<h4>Frame-by-frame Similarities:</h4><pre>{np.array_str(similarities)}</pre>"
+        video_bytes = await file.read()
+        features_fixed = extract_feature_vector(video_bytes)
+        video_id, max_similarity = compare_with_fixed_vector(features_fixed)
 
-        return HTMLResponse(
-            f"<h3>Similarity score between videos: {similarity_score}</h3>" +
-            feature_vectors_str1 +
-            feature_vectors_str2 +
-            similarity_vectors_str
-        )
-    
+        return {"video_id": video_id, "max_similarity": max_similarity}
     except Exception as e:
-        # Cleanup temporary files in case of error
-        os.remove(video1_path)
-        os.remove(video2_path)
-        return HTMLResponse(f"<h3>Error: {str(e)}</h3>")
-
-# Run FastAPI app inside Jupyter
-def run_app():
-    config = uvicorn.Config(app, host="127.0.0.1", port=8000, log_level="info")
-    server = uvicorn.Server(config)
-    server.run()
-
-# Start the FastAPI app
-run_app()
+        print(f"Error during video comparison: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error. Please check logs.")
