@@ -1,5 +1,5 @@
 import sqlite3
-from fastapi import FastAPI, HTTPException, File, UploadFile
+from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 import tensorflow as tf
 from tensorflow.keras.models import Model
 from tensorflow.keras.applications import VGG16
@@ -11,7 +11,7 @@ import tempfile
 import os
 
 # SQLite Database File Path
-DB_PATH = "sqlite_db.db"
+DB_PATH = "vectors.db"
 
 app = FastAPI()
 
@@ -25,7 +25,7 @@ def initialize_database():
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS video_features (
-            video_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            video_id TEXT PRIMARY KEY,
             feature_vector TEXT
         );
     """)
@@ -39,7 +39,6 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
-# Extract exactly 11 frames from video bytes
 # Extract exactly 11 frames from video bytes
 def extract_frames_from_bytes(video_bytes, target_frame_count=11):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video:
@@ -69,7 +68,7 @@ def extract_frames_from_bytes(video_bytes, target_frame_count=11):
     # Debug: Print actual number of frames extracted
     print(f"Extracted {len(frames)} frames.")
     
-    return np.array(frames[:target_frame_count])  # Ensure exactly `target_frame_count` frames
+    return np.array(frames[:target_frame_count])
 
 # Extract a consistent feature vector of shape (11, 4096)
 def extract_feature_vector(video_bytes):
@@ -112,58 +111,55 @@ def get_all_feature_vectors():
     return [(video_id, np.array(eval(feature_vector)).reshape(11, 4096)) for video_id, feature_vector in results]
 
 # Insert a new feature vector into the database
-def insert_new_feature_vector(feature_matrix):
+def insert_new_feature_vector(video_id, feature_matrix):
     flattened_vector = feature_matrix.flatten().tolist()
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
         """
-        INSERT INTO video_features (feature_vector)
-        VALUES (?)
+        INSERT INTO video_features (video_id, feature_vector)
+        VALUES (?, ?)
         """,
-        (str(flattened_vector),)
+        (video_id, str(flattened_vector))
     )
-    video_id = cursor.lastrowid
     conn.commit()
     cursor.close()
     conn.close()
     return video_id
 
 # Compare the video feature vector with existing vectors in the database
-def compare_with_fixed_vector(Fv_fixed, threshold=0.5):
+def compare_with_fixed_vector(file_id, Fv_fixed, threshold=0.5):
     all_feature_vectors = get_all_feature_vectors()
+    max_similarity = -1
+    most_similar_video_id = None
 
-    # If no feature vectors are present in the database, add the new vector
-    if not all_feature_vectors:
-        new_video_id = insert_new_feature_vector(Fv_fixed)
-        return -1, 0
-
-    similarities = []
     for video_id, feature_vector in all_feature_vectors:
         frame_similarities = [cosine_similarity([f_fixed], [f])[0][0] for f_fixed, f in zip(Fv_fixed, feature_vector)]
-        average_similarity = np.mean(frame_similarities)
-        similarities.append((video_id, average_similarity))
+        max_frame_similarity = max(frame_similarities)
 
-    max_video_id, max_similarity = max(similarities, key=lambda x: x[1])
+        if max_frame_similarity > max_similarity:
+            max_similarity = max_frame_similarity
+            most_similar_video_id = video_id
 
     if max_similarity < threshold:
-        new_video_id = insert_new_feature_vector(Fv_fixed)
-        return new_video_id, max_similarity
-    else:
-        return max_video_id, max_similarity
+        new_video_id = insert_new_feature_vector(file_id, Fv_fixed)
+
+    msg = False if max_similarity < threshold else True
+
+    return most_similar_video_id, max_similarity, msg
 
 @app.on_event("startup")
 def startup_event():
     initialize_database()
 
 @app.post("/compare-video-bytes/")
-async def compare_video(file: UploadFile = File(...)):
+async def compare_video(file_id: str = Form(...), file: UploadFile = File(...)):
     try:
         video_bytes = await file.read()
         features_fixed = extract_feature_vector(video_bytes)
-        video_id, max_similarity = compare_with_fixed_vector(features_fixed)
+        video_id, max_similarity, msg = compare_with_fixed_vector(file_id, features_fixed)
 
-        return {"video_id": video_id, "max_similarity": max_similarity}
+        return {"video_id": video_id, "max_similarity": max_similarity, "similar": msg}
     except Exception as e:
         print(f"Error during video comparison: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error. Please check logs.")
